@@ -1,8 +1,16 @@
+// some defines just for VSCode intellisense..
+// comment out when sending to Arduino
+//   #define ARDUINO 100
+//   #define __AVR_ATmega32U4__ 
+//   #define __AVR__ 
+
 #include <SPI.h>
 #include <TimerOne.h>
 #include <Wire.h>
 #include "RTClib.h"
 RTC_DS1307 RTC;
+
+#define NO_RTC 1 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
 
 /*
 Otto, March - September 2017
@@ -47,11 +55,19 @@ Rotary Encoder
 
 */
 
+// Pin assignements for shift registers
 #define LATCH 10 // pin 12 on HC595
 #define CLK 13   // pin 11 on HC595
 #define DATA 11  // pin 14 on HC595
 
-//--- Important: All Pins must be 8 or higher (in PORTB range)
+// Pin assignements for RotaryEncoder. Do not change 2 & 3, these are used for the interupt routines!
+enum PinAssignments {
+  encoderPinA = 2,   // right (labeled CLK on Keyes decoder)
+  encoderPinB = 3,   // left (labeled DT on Keyes decoder)
+  pushButton = 4    // switch (labeled SW on Keyes decoder)
+};
+
+//--- Important: All shift register pins must be 8 or higher (in PORTB range)
 const byte latchPinPORTB = LATCH - 8;
 const byte clockPinPORTB = CLK - 8;
 const byte dataPinPORTB = DATA - 8;
@@ -61,8 +77,8 @@ const byte dataPinPORTB = DATA - 8;
 // use one of these (eg colon) for space
 const byte symbol[43] = {
 0xFC, 0x60, 0xDA, 0xF2, 0x66, 0xB6, 0xBE, 0xE0, 0xFE, 0xF6, // 0-9
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                   // ascii 58-64, all blanks here
-0xEC, 0x3E, 0x9C, 0x7A, 0x9E, 0x8E, 0xF6, 0x2E,             // A-H
+0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,                   // ascii 58-64, all blanks here (apart from =)
+0xEE, 0x3E, 0x9C, 0x7A, 0x9E, 0x8E, 0xF6, 0x2E,             // A-H
 0x60, 0x70, 0x02, 0x1C, 0x02, 0xEC, 0xFC, 0xCE,             // I-P
 0xE6, 0x8C, 0xB6, 0x1E, 0x38, 0x7C, 0x02, 0x6E,             // Q-X
 0x66, 0xDA};                                                // Y and Z
@@ -73,21 +89,39 @@ const byte colonCode = 0x40; // same for colon
 const byte L3Code = 0x20; // same for LED 3
 const int timerDelay = 200; // speed of timer in micros
 
+const String menuOptions[6] = {"CNDY","PAPA","L=1:","L=2:","L=3:","L=4:"}; // 4 characters!
+const int menuItemCount = 6;
+const int menuDelay = 9000; // delay in millis to keep menu visible, before falling back to time
+
 // for display routine
 byte intensity = 1; // light intensity, 0-10, higher = brighter
-byte blinkSpeed = 255; // speed of blinking colon, 0-255, higher=slower
 volatile byte drawDigit = 0; // 0=digit1, .. 3=digit4
 volatile byte stepCounter = 0;
-volatile bool blinkOn = false;
+bool colonOn = false;
+bool inMenu = false;
+int activeMenuOption = 0;
+unsigned long menuStartMillis;
 
 DateTime now;
+#if NO_RTC == 1
+  unsigned long startMillis;
+#endif
 int toDisplay = 0;
 uint8_t seconds;
 
 byte digitValue[4] = {0x0, 0x0, 0x0, 0x0}; // start with empty digits
 
+// for encoder routines
+  volatile int encoderPos = 0;   // a counter for the dial
+  volatile boolean rotating = false;      // debounce management
+
+  // interrupt service routine vars
+  volatile boolean A_set = false;              
+  volatile boolean B_set = false;
+
 void setup(){
- 
+
+  // setup for shift registers (LED display)
   pinMode(LATCH, OUTPUT);  // RCLK,  pin 12 on HC595
   pinMode(CLK, OUTPUT);    // SRCLK, pin 11 on HC595
   pinMode(DATA, OUTPUT);   // SER,   pin 14 on HC595
@@ -96,20 +130,31 @@ void setup(){
   digitalWrite(DATA,LOW);
   digitalWrite(CLK,LOW);
 
-  // setup SPI
+  pinMode(encoderPinA, INPUT_PULLUP); // new method of enabling pullups
+  pinMode(encoderPinB, INPUT_PULLUP); 
+  pinMode(pushButton, INPUT_PULLUP);
+
   setupSPI();
 
-  // setup timer
   Timer1.initialize(timerDelay);
   Timer1.attachInterrupt(iProcess);
 
   // RTC code
-  Wire.begin();
-  RTC.begin();
-  
-  // following line sets the RTC to the date & time this sketch was compiled
-  //RTC.adjust(DateTime(__DATE__, __TIME__));
-  //RTC.adjust(DateTime(__DATE__, "20:29:00"));
+  #if NO_RTC == 0
+    Wire.begin();
+    RTC.begin();
+    
+    // following line sets the RTC to the date & time this sketch was compiled
+    // use this to set the clock, don't forget to comment & re-upload again
+    //RTC.adjust(DateTime(__DATE__, __TIME__));
+  #else
+    now = DateTime(__DATE__, __TIME__);
+    startMillis = millis();
+  #endif
+
+  // rotary encoder setup
+  attachInterrupt(0, doEncoderA, CHANGE);  // encoder pin on interrupt 0 (pin 2)
+  attachInterrupt(1, doEncoderB, CHANGE);  // encoder pin on interrupt 1 (pin 3)
 }
 
 void loop(){
@@ -117,24 +162,93 @@ void loop(){
   // set values for digitValue[] here
   // display will be taken care of by timer
 
-  now = RTC.now(); 
-  toDisplay = (now.hour()*100+now.minute());
-  seconds = now.second();
-  blinkOn = (seconds % 2 == 0) ? 0 : 1;
+  #if NO_RTC == 0
+    now = RTC.now();
+  #else
+    if ((millis() - startMillis) > 999) {
+      now = DateTime(now.unixtime() + 1);
+      startMillis = millis();
+    }
+  #endif
+  
+  if (inMenu == false) {
+    // show time
+    toDisplay = (now.hour()*100+now.minute());
+    seconds = now.second();
+    colonOn  = (seconds % 2 == 0) ? 0 : 1;
 
-  for(int digit = 3 ; digit >= 0 ; digit--)
+    for(int digit = 3 ; digit >= 0 ; digit--)
+    {
+      if(toDisplay>0)
+      {
+        digitValue[digit] = symbol[toDisplay % 10];
+        toDisplay /= 10;
+      }
+      else
+      {
+        digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
+      }
+    }
+    // handle encoder rotation to change time by 1 minute
+    if(encoderPos > 0)
+    {
+      #if NO_RTC == 0
+        RTC.adjust(DateTime(now.unixtime() + 60));
+      #else
+        now = DateTime(now.unixtime() + 60);
+      #endif
+      encoderPos = 0;
+    }
+    if(encoderPos < 0)
+    {
+      #if NO_RTC == 0
+        RTC.adjust(DateTime(now.unixtime() - 60));
+      #else
+        now = DateTime(now.unixtime() - 60);
+      #endif
+      encoderPos = 0;
+    } 
+  }
+  else
   {
-    if(toDisplay>0)
+    // show menu-item
+    for(int digit = 0 ; digit < 4 ; digit++)
     {
-      digitValue[digit] = symbol[toDisplay % 10];
-      toDisplay /= 10;
+      digitValue[digit] = getSymbol(menuOptions[activeMenuOption][digit]);
     }
-    else
+    // handle encoder rotation to cycle through menus
+    if(encoderPos > 0)
     {
-      digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
+      activeMenuOption ++;
+      if(activeMenuOption > (menuItemCount - 1) ) {activeMenuOption = 0;}
+      encoderPos = 0;
+      menuStartMillis = millis();
     }
+    if(encoderPos < 0)
+    {
+      activeMenuOption --;
+      if(activeMenuOption < 0 ) {activeMenuOption = menuItemCount - 1;}
+      encoderPos = 0;
+      menuStartMillis = millis();
+    }
+    if (millis() > (menuStartMillis + menuDelay)) {inMenu = false;}
   }
 
+  rotating = true;  // reset the debouncer
+
+  // handle push-button of the encoder
+  if (digitalRead(pushButton) == LOW )  {
+    if (millis() > menuStartMillis + 500)
+    {
+      inMenu = !inMenu;
+      menuStartMillis = millis();
+      colonOn = false;
+      if(activeMenuOption == 2) intensity = 0;
+      if(activeMenuOption == 3) intensity = 1;
+      if(activeMenuOption == 4) intensity = 3;
+      if(activeMenuOption == 5) intensity = 6;
+    }
+  }
 }
 
 void iProcess()
@@ -143,10 +257,10 @@ void iProcess()
   
   if(stepCounter<=intensity)
   {  
-    // send out values to shift registers
+    // send out values to shift registers. Use NOT since low=ON (see top of file)
     latchOff();
     spiTransfer(~digitValue[drawDigit]); // digitvalue for current digit -> goes to register #2
-    spiTransfer(~(digitCode[drawDigit] | (blinkOn ? colonCode : 0x0))); // position (register #1) for current digit. Use NOT since low=ON (see top of file)
+    spiTransfer(~(digitCode[drawDigit] | (colonOn ? colonCode : 0x0))); // position (register #1) for current digit & colon
     latchOn(); // update display register from shift register
   }
   else
@@ -199,3 +313,35 @@ bitSet(PORTB,latchPinPORTB);
 void latchOff(){
 bitClear(PORTB,latchPinPORTB);
 }
+
+// encoder routines
+
+  // Interrupt on A changing state
+  void doEncoderA(){
+    // debounce
+    if ( rotating ) delay (1);  // wait a little until the bouncing is done
+
+    // Test transition, did things really change? 
+    if( digitalRead(encoderPinA) != A_set ) {  // debounce once more
+      A_set = !A_set;
+
+      // adjust counter + if A leads B
+      if ( A_set && !B_set ) 
+        encoderPos += 1;
+
+      rotating = false;  // no more debouncing until loop() hits again
+    }
+  }
+
+  // Interrupt on B changing state, same as A above
+  void doEncoderB(){
+    if ( rotating ) delay (1);
+    if( digitalRead(encoderPinB) != B_set ) {
+      B_set = !B_set;
+      //  adjust counter - 1 if B leads A
+      if( B_set && !A_set ) 
+        encoderPos -= 1;
+
+      rotating = false;
+    }
+  }
