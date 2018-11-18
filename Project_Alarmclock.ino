@@ -1,8 +1,8 @@
 // some defines just for VSCode intellisense..
 // comment out when sending to Arduino
-//   #define ARDUINO 100
-//   #define __AVR_ATmega32U4__ 
-//   #define __AVR__ 
+  // #define ARDUINO 100
+  // #define __AVR_ATmega32U4__ 
+  // #define __AVR__ 
 
 #include <SPI.h>
 #include <TimerOne.h>
@@ -10,7 +10,7 @@
 #include "RTClib.h"
 RTC_DS1307 RTC;
 
-#define NO_RTC 1 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
+#define NO_RTC 0 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
 
 /*
 Otto, March - September 2017
@@ -89,18 +89,20 @@ const byte colonCode = 0x40; // same for colon
 const byte L3Code = 0x20; // same for LED 3
 const int timerDelay = 200; // speed of timer in micros
 
-const String menuOptions[6] = {"CNDY","PAPA","L=1:","L=2:","L=3:","L=4:"}; // 4 characters!
-const int menuItemCount = 6;
+const String menuText[6] = {"CNDY","PAPA","TIJD"}; // 4 characters!
+const int menuItemCount = 3;
+enum displayStatus {time, menu, setTime};
 const int menuDelay = 9000; // delay in millis to keep menu visible, before falling back to time
 
 // for display routine
-byte intensity = 1; // light intensity, 0-10, higher = brighter
+short int intensity = 1; // light intensity, 0-10, higher = brighter
 volatile byte drawDigit = 0; // 0=digit1, .. 3=digit4
-volatile byte stepCounter = 0;
+volatile short int stepCounter = 0;
 bool colonOn = false;
-bool inMenu = false;
+displayStatus currentDisplayStatus = time;
 int activeMenuOption = 0;
 unsigned long menuStartMillis;
+unsigned long blinkMillis = 0;
 
 DateTime now;
 #if NO_RTC == 1
@@ -170,83 +172,154 @@ void loop(){
       startMillis = millis();
     }
   #endif
-  
-  if (inMenu == false) {
-    // show time
-    toDisplay = (now.hour()*100+now.minute());
-    seconds = now.second();
-    colonOn  = (seconds % 2 == 0) ? 0 : 1;
 
-    for(int digit = 3 ; digit >= 0 ; digit--)
-    {
-      if(toDisplay>0)
-      {
-        digitValue[digit] = symbol[toDisplay % 10];
-        toDisplay /= 10;
-      }
-      else
-      {
-        digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
-      }
-    }
-    // handle encoder rotation to change time by 1 minute
-    if(encoderPos > 0)
-    {
-      #if NO_RTC == 0
-        RTC.adjust(DateTime(now.unixtime() + 60));
-      #else
-        now = DateTime(now.unixtime() + 60);
-      #endif
-      encoderPos = 0;
-    }
-    if(encoderPos < 0)
-    {
-      #if NO_RTC == 0
-        RTC.adjust(DateTime(now.unixtime() - 60));
-      #else
-        now = DateTime(now.unixtime() - 60);
-      #endif
-      encoderPos = 0;
-    } 
+  // show time  
+  if (currentDisplayStatus == time | currentDisplayStatus == setTime) {
+      toDisplay = (now.hour()*100 + now.minute());
   }
-  else
-  {
-    // show menu-item
-    for(int digit = 0 ; digit < 4 ; digit++)
-    {
-      digitValue[digit] = getSymbol(menuOptions[activeMenuOption][digit]);
-    }
-    // handle encoder rotation to cycle through menus
-    if(encoderPos > 0)
-    {
-      activeMenuOption ++;
-      if(activeMenuOption > (menuItemCount - 1) ) {activeMenuOption = 0;}
-      encoderPos = 0;
-      menuStartMillis = millis();
-    }
-    if(encoderPos < 0)
-    {
-      activeMenuOption --;
-      if(activeMenuOption < 0 ) {activeMenuOption = menuItemCount - 1;}
-      encoderPos = 0;
-      menuStartMillis = millis();
-    }
-    if (millis() > (menuStartMillis + menuDelay)) {inMenu = false;}
+
+  switch (currentDisplayStatus) {
+    case time:
+      for(int digit = 3 ; digit >= 0 ; digit--)
+      {
+        if(toDisplay > 0)
+        {
+          digitValue[digit] = symbol[toDisplay % 10];
+          toDisplay /= 10;
+        }
+        else
+        {
+          digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
+        }
+      }
+      // blink colon every other second
+      seconds = now.second();
+      colonOn  = (seconds % 2 == 0) ? 0 : 1;
+
+      // handle encoder rotation to set intensity
+      if(encoderPos > 0)
+      {
+        intensity ++;
+        if(intensity > 10 ) {intensity = 10;}
+        encoderPos = 0;
+      }
+      if(encoderPos < 0)
+      {
+        intensity --;
+        if(intensity < 0 ) {intensity = 0;}
+        encoderPos = 0;
+      }
+      break;
+    case setTime:
+      // show time with blink (800ms on, 200ms off)
+      if (millis() - blinkMillis > 800) {
+        for(byte i = 0; i < 4; i++)
+        {
+          digitValue[i] = 0x0;
+        }
+        colonOn = false;
+        if (millis() - blinkMillis > 1000) {
+          blinkMillis = millis();
+          colonOn = true;
+        } 
+      }
+      else {
+        for(int digit = 3 ; digit >= 0 ; digit--)
+        {
+          if(toDisplay > 0)
+          {
+            digitValue[digit] = symbol[toDisplay % 10];
+            toDisplay /= 10;
+          }
+          else
+          {
+            digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
+          }
+        }        
+      }
+
+      // handle encoder rotation to change time by 1 minute
+      if(encoderPos > 0)
+      {
+        #if NO_RTC == 0
+          RTC.adjust(DateTime(now.unixtime() + 60));
+        #else
+          now = DateTime(now.unixtime() + 60);
+        #endif
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if(encoderPos < 0)
+      {
+        #if NO_RTC == 0
+          RTC.adjust(DateTime(now.unixtime() - 60));
+        #else
+          now = DateTime(now.unixtime() - 60);
+        #endif
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if (millis() - menuStartMillis > menuDelay) {currentDisplayStatus = time;}
+      break;
+    case displayStatus::menu :
+      for(int digit = 0 ; digit < 4 ; digit++)
+      {
+        digitValue[digit] = getSymbol(menuText[activeMenuOption][digit]);
+      }
+      // handle encoder rotation to cycle through menus
+      if(encoderPos > 0)
+      {
+        activeMenuOption ++;
+        if(activeMenuOption > (menuItemCount - 1) ) {activeMenuOption = 0;}
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if(encoderPos < 0)
+      {
+        activeMenuOption --;
+        if(activeMenuOption < 0 ) {activeMenuOption = menuItemCount - 1;}
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if (millis() - menuStartMillis > menuDelay) {currentDisplayStatus = time;}
+      break;
   }
 
   rotating = true;  // reset the debouncer
 
   // handle push-button of the encoder
   if (digitalRead(pushButton) == LOW )  {
-    if (millis() > menuStartMillis + 500)
+    if (millis() - menuStartMillis > 500)
     {
-      inMenu = !inMenu;
       menuStartMillis = millis();
-      colonOn = false;
-      if(activeMenuOption == 2) intensity = 0;
-      if(activeMenuOption == 3) intensity = 1;
-      if(activeMenuOption == 4) intensity = 3;
-      if(activeMenuOption == 5) intensity = 6;
+      switch (currentDisplayStatus)
+      {
+        case time:
+          currentDisplayStatus = menu;
+          colonOn = false;
+          break;
+        case setTime:
+          currentDisplayStatus = time;
+          break;
+        case menu:
+          switch (activeMenuOption)
+          {
+            case 0:
+              /* Name 1 */
+            case 1:
+              /* Name 2 */
+              currentDisplayStatus = time;              
+              break;
+            case 2:
+              /* set time */
+              currentDisplayStatus = setTime;
+              colonOn = true;
+              break;
+            default:
+              break;
+          }
+          break;
+      }
     }
   }
 }
@@ -279,7 +352,6 @@ void iProcess()
     drawDigit = (drawDigit==3) ? 0 : drawDigit+1;
     stepCounter = 0;
   }
-
 }
 
 void setupSPI()
