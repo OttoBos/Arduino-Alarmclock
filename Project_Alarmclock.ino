@@ -1,19 +1,13 @@
-// some defines just for VSCode intellisense..
-// comment out when sending to Arduino
-  // #define ARDUINO 100
-  // #define __AVR_ATmega32U4__ 
-  // #define __AVR__ 
-
 #include <SPI.h>
 #include <TimerOne.h>
 #include <Wire.h>
 #include "RTClib.h"
 RTC_DS1307 RTC;
 
-#define NO_RTC 0 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
+#define NO_RTC 1 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
 
 /*
-Otto, March - September 2017
+Otto, March - September 2017, August 2020
 
 Shift registers & display
     setup using two shift registers to drive 4-segment LED
@@ -49,22 +43,27 @@ RTC
     see http://www.elecrow.com/wiki/index.php?title=Tiny_RTC
 
 Rotary Encoder
-    encoder connected to:
-    - --> not implemented yet
+    encoder connected to (digital) pins 2, 3 and 4
     code from http://playground.arduino.cc/Main/RotaryEncoders, the rafbuff part (adapted to get rid of delay in interupt routine)
 
+Sound
+   Arduino tone library documentation (http://arduino.cc/en/Tutorial/Tone)
+   plan: use https://github.com/robsoncouto/arduino-songs!
 */
+
+#include "melody.h"
 
 // Pin assignements for shift registers
 #define LATCH 10 // pin 12 on HC595
 #define CLK 13   // pin 11 on HC595
 #define DATA 11  // pin 14 on HC595
 
-// Pin assignements for RotaryEncoder. Do not change 2 & 3, these are used for the interupt routines!
+// Pin assignements for RotaryEncoder & speaker. Do not change 2 & 3, these are used for the interupt routines!
 enum PinAssignments {
   encoderPinA = 2,   // right (labeled CLK on Keyes decoder)
   encoderPinB = 3,   // left (labeled DT on Keyes decoder)
-  pushButton = 4    // switch (labeled SW on Keyes decoder)
+  pushButton = 4,    // switch (labeled SW on Keyes decoder)
+  speakerPin = 8        // speaker (via 100 Ohm or more resistor)
 };
 
 //--- Important: All shift register pins must be 8 or higher (in PORTB range)
@@ -86,12 +85,12 @@ const byte symbol[43] = {
 const byte digitCode[4] = {0x08, 0x04, 0x02, 0x01};
 const byte dPointCode = 0x80; // add to output for register #1 to switch on digital point
 const byte colonCode = 0x40; // same for colon
-const byte L3Code = 0x20; // same for LED 3
+const byte led3Code = 0x20; // same for LED 3
 const int timerDelay = 200; // speed of timer in micros
 
 const String menuText[6] = {"CNDY","PAPA","TIJD"}; // 4 characters!
 const int menuItemCount = 3;
-enum displayStatus {time, menu, setTime};
+enum displayStatus {time, menu, setTime, playingMelody};
 const int menuDelay = 9000; // delay in millis to keep menu visible, before falling back to time
 
 // for display routine
@@ -99,10 +98,17 @@ short int intensity = 1; // light intensity, 0-10, higher = brighter
 volatile byte drawDigit = 0; // 0=digit1, .. 3=digit4
 volatile short int stepCounter = 0;
 bool colonOn = false;
+bool led3On = false;
 displayStatus currentDisplayStatus = time;
 int activeMenuOption = 0;
 unsigned long menuStartMillis;
 unsigned long blinkMillis = 0;
+
+// for sound / melody
+unsigned long noteMillis;
+int currentNote = 0;
+int noteDuration;
+int note;
 
 DateTime now;
 #if NO_RTC == 1
@@ -174,12 +180,12 @@ void loop(){
   #endif
 
   // show time  
-  if (currentDisplayStatus == time | currentDisplayStatus == setTime) {
+  if (currentDisplayStatus == time | currentDisplayStatus == setTime | currentDisplayStatus == playingMelody) {
       toDisplay = (now.hour()*100 + now.minute());
   }
 
   switch (currentDisplayStatus) {
-    case time:
+    case displayStatus::time:
       for(int digit = 3 ; digit >= 0 ; digit--)
       {
         if(toDisplay > 0)
@@ -210,7 +216,7 @@ void loop(){
         encoderPos = 0;
       }
       break;
-    case setTime:
+    case displayStatus::setTime:
       // show time with blink (800ms on, 200ms off)
       if (millis() - blinkMillis > 800) {
         for(byte i = 0; i < 4; i++)
@@ -261,7 +267,7 @@ void loop(){
       }
       if (millis() - menuStartMillis > menuDelay) {currentDisplayStatus = time;}
       break;
-    case displayStatus::menu :
+    case displayStatus::menu:
       for(int digit = 0 ; digit < 4 ; digit++)
       {
         digitValue[digit] = getSymbol(menuText[activeMenuOption][digit]);
@@ -283,6 +289,36 @@ void loop(){
       }
       if (millis() - menuStartMillis > menuDelay) {currentDisplayStatus = time;}
       break;
+    case displayStatus::playingMelody:
+      // show time
+      for(int digit = 3 ; digit >= 0 ; digit--)
+      {
+        if(toDisplay > 0)
+        {
+          digitValue[digit] = symbol[toDisplay % 10];
+          toDisplay /= 10;
+        }
+        else
+        {
+          digitValue[digit] = (digit==3) ? symbol[0] : 0x0;
+        }
+      }
+      // blink led3 every other second
+      seconds = now.second();
+      led3On  = (seconds % 2 == 0) ? 0 : 1;      
+
+      // check if we need to change note
+      if((millis() - noteMillis) > noteDuration * 1.30)
+      {
+        currentNote++;
+        if(currentNote >= noteCount) {currentNote = 0;}
+        noteDuration = 1000 / tempo[currentNote];
+        note = melody[currentNote];
+        noteMillis = millis();
+        tone(speakerPin, note, noteDuration);
+      }
+
+      break;
   }
 
   rotating = true;  // reset the debouncer
@@ -294,18 +330,33 @@ void loop(){
       menuStartMillis = millis();
       switch (currentDisplayStatus)
       {
-        case time:
+        case displayStatus::time:
           currentDisplayStatus = menu;
           colonOn = false;
           break;
-        case setTime:
+        case displayStatus::setTime:
           currentDisplayStatus = time;
           break;
-        case menu:
+        case displayStatus::playingMelody:
+          // stop playing melody
+          noTone(speakerPin);
+          currentDisplayStatus = time;
+          led3On = false;
+          break;          
+        case displayStatus::menu:
           switch (activeMenuOption)
           {
             case 0:
               /* Name 1 */
+              currentDisplayStatus = playingMelody;  
+              // start playing melody!
+              currentNote = 0;
+              noteDuration = 1000/tempo[currentNote];
+              note = melody[currentNote];
+              noteMillis = millis();
+              tone(speakerPin, note, noteDuration);
+              colonOn = true;
+              break;
             case 1:
               /* Name 2 */
               currentDisplayStatus = time;              
@@ -333,7 +384,7 @@ void iProcess()
     // send out values to shift registers. Use NOT since low=ON (see top of file)
     latchOff();
     spiTransfer(~digitValue[drawDigit]); // digitvalue for current digit -> goes to register #2
-    spiTransfer(~(digitCode[drawDigit] | (colonOn ? colonCode : 0x0))); // position (register #1) for current digit & colon
+    spiTransfer(~(digitCode[drawDigit] | (colonOn ? colonCode : 0x0) | (led3On ? led3Code : 0x0)))  ; // position (register #1) for current digit & colon 
     latchOn(); // update display register from shift register
   }
   else
