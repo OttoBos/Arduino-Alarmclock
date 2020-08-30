@@ -4,7 +4,7 @@
 #include "RTClib.h"
 RTC_DS1307 RTC;
 
-#define NO_RTC 1 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
+#define NO_RTC 0 // for developing, when no RTC board is present (1=development, 0=production) -> will use millis as semi-RTC
 
 /*
   Otto, March - September 2017, August 2020
@@ -48,7 +48,7 @@ RTC_DS1307 RTC;
 
   Sound
    Arduino tone library documentation (http://arduino.cc/en/Tutorial/Tone)
-   plan: use https://github.com/robsoncouto/arduino-songs!
+   songs from https://github.com/robsoncouto/arduino-songs!
 */
 
 #include "melody.h"
@@ -76,7 +76,7 @@ const byte dataPinPORTB = DATA - 8;
 // use one of these (eg colon) for space
 const byte symbol[43] = {
   0xFC, 0x60, 0xDA, 0xF2, 0x66, 0xB6, 0xBE, 0xE0, 0xFE, 0xF6, // 0-9
-  0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,                   // ascii 58-64, all blanks here (apart from =)
+  0x00, 0x00, 0x02, 0x12, 0x02, 0x00, 0x00,                   // ascii 58-64, all blanks here (apart from =, > and < )
   0xEE, 0x3E, 0x9C, 0x7A, 0x9E, 0x8E, 0xF6, 0x2E,             // A-H
   0x60, 0x70, 0x02, 0x1C, 0x02, 0xEC, 0xFC, 0xCE,             // I-P
   0xE6, 0x8C, 0xB6, 0x1E, 0x38, 0x7C, 0x02, 0x6E,             // Q-X
@@ -87,11 +87,12 @@ const byte digitCode[4] = {0x08, 0x04, 0x02, 0x01};
 const byte dPointCode = 0x80; // add to output for register #1 to switch on digital point
 const byte colonCode = 0x40; // same for colon
 const byte led3Code = 0x20; // same for LED 3
-const int timerDelay = 200; // speed of timer in micros
+const int timerDelay = 200; // speed of timer in micros -> display routine will be called every X micros
 
-const String menuText[6] = {"CNDY", "PAPA", "TIJD"}; // 4 characters!
-const int menuItemCount = 3;
-enum displayStatus {time, menu, setTime, playingMelody};
+// menu variables
+const String menuText[6] = {"CNDY", "PAPA", "TIJD", "ALAR", "AL>?"}; // 4 characters!
+const int menuItemCount = 5;
+enum displayStatus {time, menu, setTime, setAlarm, playingMelody};
 const int menuDelay = 9000; // delay in millis to keep menu visible, before falling back to time
 
 // for display routine
@@ -104,25 +105,28 @@ displayStatus currentDisplayStatus = time;
 int activeMenuOption = 0;
 unsigned long menuStartMillis;
 unsigned long blinkMillis = 0;
+byte digitValue[4] = {0x0, 0x0, 0x0, 0x0}; // start with empty digits
 
 // for sound / melody
 unsigned long noteMillis;
+unsigned long soundMillis;
+const long maxPlayDuration = 60000; // repeat song for max 1 minute
 int *melody;
 int currentNote = 0;
 int divider;
 int noteDuration;
-int noteCount;
 int tempo;
 int wholenote;
 
+// timekeeping variables
 DateTime now;
 #if NO_RTC == 1
 unsigned long startMillis;
 #endif
 int toDisplay = 0;
-uint8_t seconds;
-
-byte digitValue[4] = {0x0, 0x0, 0x0, 0x0}; // start with empty digits
+int alarmHour = 7;
+int alarmMinute = 0;
+bool alarmActive = false;
 
 // for encoder routines
 volatile int encoderPos = 0;   // a counter for the dial
@@ -159,7 +163,7 @@ void setup() {
 
   // following line sets the RTC to the date & time this sketch was compiled
   // use this to set the clock, don't forget to comment & re-upload again
-  //RTC.adjust(DateTime(__DATE__, __TIME__));
+  // RTC.adjust(DateTime(__DATE__, __TIME__));
 #else
   now = DateTime(__DATE__, __TIME__);
   startMillis = millis();
@@ -172,9 +176,6 @@ void setup() {
 
 void loop() {
 
-  // set values for digitValue[] here
-  // display will be taken care of by timer
-
 #if NO_RTC == 0
   now = RTC.now();
 #else
@@ -184,13 +185,20 @@ void loop() {
   }
 #endif
 
-  // show time
-  if (currentDisplayStatus == time | currentDisplayStatus == setTime | currentDisplayStatus == playingMelody) {
+  // show time (or alarm time)
+  if (currentDisplayStatus == time || currentDisplayStatus == setTime || currentDisplayStatus == playingMelody) {
     toDisplay = (now.hour() * 100 + now.minute());
   }
+  if (currentDisplayStatus == setAlarm) {
+    toDisplay = (alarmHour * 100 + alarmMinute);
+  }
 
+  // show value & handle rotation
+  // set values for digitValue[] here
+  // actual display itself will be taken care of by timer
   switch (currentDisplayStatus) {
     case displayStatus::time:
+      led3On = alarmActive;
       for (int digit = 3 ; digit >= 0 ; digit--)
       {
         if (toDisplay > 0)
@@ -204,8 +212,7 @@ void loop() {
         }
       }
       // blink colon every other second
-      seconds = now.second();
-      colonOn  = (seconds % 2 == 0) ? 0 : 1;
+      colonOn  = (now.second() % 2 == 0) ? 0 : 1;
 
       // handle encoder rotation to set intensity
       if (encoderPos > 0)
@@ -224,8 +231,26 @@ void loop() {
         }
         encoderPos = 0;
       }
+
+      // check if alarm must go off
+      if (alarmActive && now.hour() == alarmHour && now.minute() == alarmMinute && now.second() == 0)
+      {
+          /* Go play alarm! */
+          currentDisplayStatus = playingMelody;
+    
+          // select melody
+          melody = melody3;
+          tempo = tempo3;
+    
+          // setup melody parameters, rest is taken care of in the loop
+          wholenote = (60000 * 4) / tempo;
+          currentNote = 0;
+          noteDuration = 0;
+          soundMillis = millis();
+      }
       break;
     case displayStatus::setTime:
+      led3On = alarmActive;
       // show time with blink (800ms on, 200ms off)
       if (millis() - blinkMillis > 800) {
         for (byte i = 0; i < 4; i++)
@@ -283,6 +308,11 @@ void loop() {
       {
         digitValue[digit] = getSymbol(menuText[activeMenuOption][digit]);
       }
+      if(activeMenuOption == 4)
+      {
+        // toggle alarm -> show current status as 4th digit
+        digitValue[3] = alarmActive ? symbol[1] : symbol [0];
+      }
       // handle encoder rotation to cycle through menus
       if (encoderPos > 0)
       {
@@ -306,6 +336,70 @@ void loop() {
         currentDisplayStatus = time;
       }
       break;
+    case displayStatus::setAlarm:
+      led3On = alarmActive;
+      // show time with blink (800ms on, 200ms off)
+      if (millis() - blinkMillis > 800) {
+        for (byte i = 0; i < 4; i++)
+        {
+          digitValue[i] = 0x0;
+        }
+        colonOn = false;
+        if (millis() - blinkMillis > 1000) {
+          blinkMillis = millis();
+          colonOn = true;
+        }
+      }
+      else {
+        for (int digit = 3 ; digit >= 0 ; digit--)
+        {
+          if (toDisplay > 0)
+          {
+            digitValue[digit] = symbol[toDisplay % 10];
+            toDisplay /= 10;
+          }
+          else
+          {
+            digitValue[digit] = (digit == 3) ? symbol[0] : 0x0;
+          }
+        }
+      }
+
+      // handle encoder rotation to change alarmtime by 1 minute
+      if (encoderPos > 0)
+      {
+        alarmMinute++;
+        if(alarmMinute>=60)
+        {
+          alarmMinute = 0;
+          alarmHour++;
+          if(alarmHour>=24)
+          {
+            alarmHour = 0;
+          }
+        }
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if (encoderPos < 0)
+      {
+        alarmMinute--;
+        if(alarmMinute<0)
+        {
+          alarmMinute = 59;
+          alarmHour--;
+          if(alarmHour<0)
+          {
+            alarmHour = 23;
+          }
+        }
+        encoderPos = 0;
+        menuStartMillis = millis();
+      }
+      if (millis() - menuStartMillis > menuDelay) {
+        currentDisplayStatus = time;
+      }
+      break;
     case displayStatus::playingMelody:
       // show time
       for (int digit = 3 ; digit >= 0 ; digit--)
@@ -320,9 +414,9 @@ void loop() {
           digitValue[digit] = (digit == 3) ? symbol[0] : 0x0;
         }
       }
-      // blink led3 every other second
-      seconds = now.second();
-      led3On  = (seconds % 2 == 0) ? 0 : 1;
+      // blink led3 & colon every other second
+      led3On  = (now.second() % 2 == 0) ? 0 : 1;
+      colonOn  = !led3On;
 
       // check if we need to change note
       if ((millis() - noteMillis) > noteDuration)
@@ -341,12 +435,18 @@ void loop() {
         tone(speakerPin, *(melody + currentNote), noteDuration*0.9);
 
         currentNote += 2;
-        if (currentNote >= noteCount) {
+        if (*(melody + currentNote) == END) {
           currentNote = 0;
         }
-
       }
 
+      // check if max song duration reached
+      if((millis() - soundMillis) > maxPlayDuration)
+      {
+          // stop playing melody
+          noTone(speakerPin);
+          currentDisplayStatus = time;       
+      }
       break;
   }
 
@@ -362,7 +462,9 @@ void loop() {
         case displayStatus::time:
           currentDisplayStatus = menu;
           colonOn = false;
+          led3On = false;
           break;
+        case displayStatus::setAlarm:
         case displayStatus::setTime:
           currentDisplayStatus = time;
           break;
@@ -370,46 +472,56 @@ void loop() {
           // stop playing melody
           noTone(speakerPin);
           currentDisplayStatus = time;
-          led3On = false;
           break;
         case displayStatus::menu:
           switch (activeMenuOption)
           {
             case 0:
               /* Name 1 */
-              currentDisplayStatus = playingMelody;
+              currentDisplayStatus = displayStatus::playingMelody;
 
               // select melody
               melody = melody2;
               tempo = tempo2;
-              noteCount = sizeof(melody2) / sizeof(melody2[0]) / 2;
 
               // setup melody parameters, rest is taken care of in the loop
               wholenote = (60000 * 4) / tempo;
               currentNote = 0;
               noteDuration = 0;
+              soundMillis = millis();
               colonOn = true;
               break;
             case 1:
               /* Name 2 */
-              currentDisplayStatus = playingMelody;
+              currentDisplayStatus = displayStatus::playingMelody;
 
               // select melody
               melody = melody1;
               tempo = tempo1;
-              noteCount = sizeof(melody1) / sizeof(melody1[0]) / 2;
 
               // setup melody parameters, rest is taken care of in the loop
               wholenote = (60000 * 4) / tempo;
               currentNote = 0;
               noteDuration = 0;
+              soundMillis = millis();              
               colonOn = true;
               break;
             case 2:
               /* set time */
-              currentDisplayStatus = setTime;
+              currentDisplayStatus = displayStatus::setTime;
               colonOn = true;
               break;
+            case 3:
+              /* set alarm */
+              currentDisplayStatus = displayStatus::setAlarm;
+              colonOn = true;
+              break;
+            case 4:
+              /* toggle alarm */
+              currentDisplayStatus = displayStatus::time;
+              alarmActive = !alarmActive;
+              colonOn = true;
+              break;              
             default:
               break;
           }
